@@ -1,0 +1,106 @@
+name: Publish Debian Repository
+
+on:
+  workflow_call:
+    inputs:
+      deb-file-name:
+        description: 'Artifact name of the .deb file (from build_deb workflow)'
+        required: true
+        type: string
+      gpg-key-id:
+        description: 'GPG key ID for signing (falls back to vars.GPG_KEY_ID if not set)'
+        required: false
+        type: string
+    secrets:
+      GPG_PRIVATE_KEY:
+        required: true
+      PAGES_DEPLOY_KEY:
+        required: true
+  workflow_dispatch:
+    inputs:
+      deb-url:
+        description: 'URL to download a .deb file'
+        required: true
+        type: string
+
+concurrency:
+  group: debian-repo-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y reprepro
+
+      - name: Set GPG key ID
+        id: gpg
+        run: |
+          GPG_KEY_ID="${{ inputs.gpg-key-id || vars.GPG_KEY_ID }}"
+          if [ -z "$GPG_KEY_ID" ]; then
+            echo "::error::No GPG key ID provided (set input or vars.GPG_KEY_ID)"
+            exit 1
+          fi
+          echo "key-id=$GPG_KEY_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Import GPG signing key
+        run: |
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+          echo "${{ steps.gpg.outputs.key-id }}:6:" | gpg --batch --import-ownertrust
+
+      - name: Download .deb from artifact
+        if: inputs.deb-file-name
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ inputs.deb-file-name }}
+          path: incoming
+
+      - name: Download .deb from URL
+        if: inputs.deb-url
+        run: make get-deb deb="${{ inputs.deb-url }}"
+
+      - name: Identify .deb file
+        id: deb
+        run: |
+          DEB_FILE=$(ls incoming/*.deb 2>/dev/null | head -1)
+          if [ -z "$DEB_FILE" ]; then
+            echo "::error::No .deb file found in incoming/"
+            exit 1
+          fi
+          echo "path=$DEB_FILE" >> "$GITHUB_OUTPUT"
+          echo "Found: $DEB_FILE ($(du -h "$DEB_FILE" | cut -f1))"
+
+      - name: Build repository with reprepro
+        run: |
+          mkdir -p repo/conf
+
+          cat > repo/conf/distributions <<EOF
+          Origin: Learning Equality
+          Label: Kolibri
+          Suite: stable
+          Codename: stable
+          Architectures: all
+          Components: main
+          Description: Kolibri Debian repository
+          SignWith: ${{ steps.gpg.outputs.key-id }}
+          EOF
+
+          reprepro -b repo includedeb stable "${{ steps.deb.outputs.path }}"
+
+          # Export public key for users
+          gpg --armor --export "${{ steps.gpg.outputs.key-id }}" > repo/pubkey.asc
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          deploy_key: ${{ secrets.PAGES_DEPLOY_KEY }}
+          external_repository: learningequality/kolibri-installer-debian
+          publish_dir: ./repo
+          publish_branch: gh-pages
